@@ -3,7 +3,7 @@ import { ANTIGRAVITY_ENDPOINT_FALLBACKS, ANTIGRAVITY_PROVIDER_ID } from "./const
 import { authorizeAntigravity, exchangeAntigravity } from "./antigravity/oauth";
 import type { AntigravityTokenExchangeResult } from "./antigravity/oauth";
 import { accessTokenExpired, isOAuthAuth, parseRefreshParts } from "./plugin/auth";
-import { promptAddAnotherAccount, promptProjectId } from "./plugin/cli";
+import { promptAddAnotherAccount, promptLoginMode, promptProjectId } from "./plugin/cli";
 import { ensureProjectContext } from "./plugin/project";
 import { startAntigravityDebugRequest } from "./plugin/debug";
 import {
@@ -13,7 +13,7 @@ import {
 } from "./plugin/request";
 import { AntigravityTokenRefreshError, refreshAccessToken } from "./plugin/token";
 import { startOAuthListener, type OAuthListener } from "./plugin/server";
-import { loadAccounts, saveAccounts } from "./plugin/storage";
+import { clearAccounts, loadAccounts, saveAccounts } from "./plugin/storage";
 import { AccountManager } from "./plugin/accounts";
 import type {
   GetAuth,
@@ -112,13 +112,17 @@ function clampInt(value: number, min: number, max: number): number {
 
 async function persistAccountPool(
   results: Array<Extract<AntigravityTokenExchangeResult, { type: "success" }>>,
+  replaceAll: boolean = false,
 ): Promise<void> {
   if (results.length === 0) {
     return;
   }
 
   const now = Date.now();
-  const stored = await loadAccounts();
+  
+  // If replaceAll is true (fresh login), start with empty accounts
+  // Otherwise, load existing accounts and merge
+  const stored = replaceAll ? null : await loadAccounts();
   const accounts = stored?.accounts ? [...stored.accounts] : [];
 
   const indexByRefreshToken = new Map<string, number>();
@@ -169,8 +173,10 @@ async function persistAccountPool(
     return;
   }
 
-  const activeIndex =
-    typeof stored?.activeIndex === "number" && Number.isFinite(stored.activeIndex) ? stored.activeIndex : 0;
+  // For fresh logins, always start at index 0
+  const activeIndex = replaceAll 
+    ? 0 
+    : (typeof stored?.activeIndex === "number" && Number.isFinite(stored.activeIndex) ? stored.activeIndex : 0);
 
   await saveAccounts({
     version: 1,
@@ -200,6 +206,35 @@ function retryAfterMsFromResponse(response: Response): number {
 }
 
 /**
+ * Sleep for a given number of milliseconds, respecting an abort signal.
+ */
+function sleep(ms: number, signal?: AbortSignal | null): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason instanceof Error ? signal.reason : new Error("Aborted"));
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+
+    const onAbort = () => {
+      cleanup();
+      reject(signal?.reason instanceof Error ? signal.reason : new Error("Aborted"));
+    };
+
+    const cleanup = () => {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", onAbort);
+    };
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
  * Creates an Antigravity OAuth plugin for a specific provider ID.
  */
 export const createAntigravityPlugin = (providerId: string) => async (
@@ -207,10 +242,43 @@ export const createAntigravityPlugin = (providerId: string) => async (
 ): Promise<PluginResult> => ({
   auth: {
     provider: providerId,
-    loader: async (getAuth: GetAuth, provider: Provider): Promise<LoaderResult | null> => {
+    loader: async (getAuth: GetAuth, provider: Provider): Promise<LoaderResult | Record<string, unknown>> => {
+      // Track which account was used in the previous request for detecting switches
+      let previousAccountIndex: number | null = null;
       const auth = await getAuth();
+      
+      // If OpenCode has no valid OAuth auth, clear any stale account storage
       if (!isOAuthAuth(auth)) {
-        return null;
+        try {
+          await clearAccounts();
+        } catch {
+          // ignore
+        }
+        return {};
+      }
+
+      // Validate that stored accounts are in sync with OpenCode's auth
+      // If OpenCode's refresh token doesn't match any stored account, clear stale storage
+      const authParts = parseRefreshParts(auth.refresh);
+      const storedAccounts = await loadAccounts();
+      
+      if (storedAccounts && storedAccounts.accounts.length > 0 && authParts.refreshToken) {
+        const hasMatchingAccount = storedAccounts.accounts.some(
+          (acc) => acc.refreshToken === authParts.refreshToken
+        );
+        
+        if (!hasMatchingAccount) {
+          // OpenCode's auth doesn't match any stored account - storage is stale
+          // Clear it and let the user re-authenticate
+          console.warn(
+            "[opencode-antigravity-auth] Stored accounts don't match OpenCode's auth. Clearing stale storage."
+          );
+          try {
+            await clearAccounts();
+          } catch {
+            // ignore
+          }
+        }
       }
 
       const accountManager = await AccountManager.loadFromDisk(auth);
@@ -246,8 +314,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
             return fetch(input, init);
           }
 
-          const accountCount = accountManager.getAccountCount();
-          if (accountCount === 0) {
+          if (accountManager.getAccountCount() === 0) {
             throw new Error("No Antigravity accounts configured. Run `opencode auth login`.");
           }
 
@@ -266,16 +333,56 @@ export const createAntigravityPlugin = (providerId: string) => async (
 
           let lastFailure: FailureContext | null = null;
           let lastError: Error | null = null;
+          const abortSignal = init?.signal ?? undefined;
 
-          accountLoop: for (let attempt = 0; attempt < accountCount; attempt++) {
-            const account = accountManager.pickNext();
-            if (!account) {
-              const waitMs = accountManager.getMinWaitTimeMs();
-              const waitSec = Math.max(1, Math.ceil(waitMs / 1000));
-              throw new Error(
-                `All ${accountManager.getAccountCount()} account(s) are rate-limited. Retry in ${waitSec}s or add more accounts via 'opencode auth login'.`,
-              );
+          // Use while(true) loop to handle rate limits with backoff
+          // This ensures we wait and retry when all accounts are rate-limited
+          while (true) {
+            const accountCount = accountManager.getAccountCount();
+            
+            if (accountCount === 0) {
+              throw new Error("No Antigravity accounts available. Run `opencode auth login`.");
             }
+
+            const account = accountManager.pickNext();
+            
+            if (!account) {
+              // All accounts are rate-limited - wait and retry
+              const waitMs = accountManager.getMinWaitTimeMs() || 60_000;
+              const waitSec = Math.max(1, Math.ceil(waitMs / 1000));
+
+              try {
+                await client.tui.showToast({
+                  body: {
+                    message: `All ${accountCount} account(s) rate-limited. Waiting ${waitSec}s...`,
+                    variant: "warning",
+                  },
+                });
+              } catch {
+                // TUI may not be available
+              }
+
+              // Wait for the cooldown to expire
+              await sleep(waitMs, abortSignal);
+              continue;
+            }
+
+            // Show toast when switching to a different account
+            const isAccountSwitch = previousAccountIndex !== null && previousAccountIndex !== account.index;
+            if (isAccountSwitch || previousAccountIndex === null) {
+              const accountLabel = account.email || `Account ${account.index + 1}`;
+              try {
+                await client.tui.showToast({
+                  body: {
+                    message: `Using ${accountLabel}${accountCount > 1 ? ` (${account.index + 1}/${accountCount})` : ""}`,
+                    variant: "info",
+                  },
+                });
+              } catch {
+                // TUI may not be available
+              }
+            }
+            previousAccountIndex = account.index;
 
             try {
               await accountManager.saveToDisk();
@@ -320,7 +427,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
                     try {
                       await client.auth.set({
                         path: { id: providerId },
-                        body: { type: "oauth", refresh: "" },
+                        body: { type: "oauth", refresh: "", access: "", expires: 0 },
                       });
                     } catch (storeError) {
                       console.error("Failed to clear stored Antigravity OAuth credentials:", storeError);
@@ -364,6 +471,9 @@ export const createAntigravityPlugin = (providerId: string) => async (
               }
             }
 
+            // Try endpoint fallbacks
+            let shouldSwitchAccount = false;
+            
             for (let i = 0; i < ANTIGRAVITY_ENDPOINT_FALLBACKS.length; i++) {
               const currentEndpoint = ANTIGRAVITY_ENDPOINT_FALLBACKS[i];
 
@@ -390,39 +500,87 @@ export const createAntigravityPlugin = (providerId: string) => async (
 
                 const response = await fetch(prepared.request, prepared.init);
 
-                if (response.status === 429 && accountManager.getAccountCount() > 1) {
+                // Handle 429 rate limit
+                if (response.status === 429) {
                   const retryAfterMs = retryAfterMsFromResponse(response);
                   accountManager.markRateLimited(account, retryAfterMs);
+
                   try {
                     await accountManager.saveToDisk();
                   } catch (error) {
                     console.error("[opencode-antigravity-auth] Failed to persist rate-limit state:", error);
                   }
 
-                  lastFailure = {
-                    response,
-                    streaming: prepared.streaming,
-                    debugContext,
-                    requestedModel: prepared.requestedModel,
-                    projectId: prepared.projectId,
-                    endpoint: prepared.endpoint,
-                    effectiveModel: prepared.effectiveModel,
-                    toolDebugMissing: prepared.toolDebugMissing,
-                    toolDebugSummary: prepared.toolDebugSummary,
-                    toolDebugPayload: prepared.toolDebugPayload,
-                  };
-
-                  continue accountLoop;
+                  const accountLabel = account.email || `Account ${account.index + 1}`;
+                  
+                  if (accountManager.getAccountCount() > 1) {
+                    // Multiple accounts - switch to next
+                    try {
+                      await client.tui.showToast({
+                        body: {
+                          message: `Rate limited on ${accountLabel}. Switching...`,
+                          variant: "warning",
+                        },
+                      });
+                    } catch {
+                      // TUI may not be available
+                    }
+                    
+                    lastFailure = {
+                      response,
+                      streaming: prepared.streaming,
+                      debugContext,
+                      requestedModel: prepared.requestedModel,
+                      projectId: prepared.projectId,
+                      endpoint: prepared.endpoint,
+                      effectiveModel: prepared.effectiveModel,
+                      toolDebugMissing: prepared.toolDebugMissing,
+                      toolDebugSummary: prepared.toolDebugSummary,
+                      toolDebugPayload: prepared.toolDebugPayload,
+                    };
+                    shouldSwitchAccount = true;
+                    break;
+                  } else {
+                    // Single account - wait and retry
+                    const waitSec = Math.max(1, Math.ceil(retryAfterMs / 1000));
+                    try {
+                      await client.tui.showToast({
+                        body: {
+                          message: `Rate limited. Waiting ${waitSec}s...`,
+                          variant: "warning",
+                        },
+                      });
+                    } catch {
+                      // TUI may not be available
+                    }
+                    
+                    lastFailure = {
+                      response,
+                      streaming: prepared.streaming,
+                      debugContext,
+                      requestedModel: prepared.requestedModel,
+                      projectId: prepared.projectId,
+                      endpoint: prepared.endpoint,
+                      effectiveModel: prepared.effectiveModel,
+                      toolDebugMissing: prepared.toolDebugMissing,
+                      toolDebugSummary: prepared.toolDebugSummary,
+                      toolDebugPayload: prepared.toolDebugPayload,
+                    };
+                    
+                    // Wait and let the outer loop retry
+                    await sleep(retryAfterMs, abortSignal);
+                    shouldSwitchAccount = true;
+                    break;
+                  }
                 }
 
-                const shouldRetry = (
+                const shouldRetryEndpoint = (
                   response.status === 403 ||
                   response.status === 404 ||
-                  (response.status === 429 && accountManager.getAccountCount() <= 1) ||
                   response.status >= 500
                 );
 
-                if (shouldRetry && i < ANTIGRAVITY_ENDPOINT_FALLBACKS.length - 1) {
+                if (shouldRetryEndpoint && i < ANTIGRAVITY_ENDPOINT_FALLBACKS.length - 1) {
                   lastFailure = {
                     response,
                     streaming: prepared.streaming,
@@ -438,6 +596,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   continue;
                 }
 
+                // Success or non-retryable error - return the response
                 return transformAntigravityResponse(
                   response,
                   prepared.streaming,
@@ -456,28 +615,35 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   continue;
                 }
 
+                // All endpoints failed for this account - try next account
                 lastError = error instanceof Error ? error : new Error(String(error));
-                continue accountLoop;
+                shouldSwitchAccount = true;
+                break;
               }
             }
-          }
+            
+            if (shouldSwitchAccount) {
+              continue;
+            }
 
-          if (lastFailure) {
-            return transformAntigravityResponse(
-              lastFailure.response,
-              lastFailure.streaming,
-              lastFailure.debugContext,
-              lastFailure.requestedModel,
-              lastFailure.projectId,
-              lastFailure.endpoint,
-              lastFailure.effectiveModel,
-              lastFailure.toolDebugMissing,
-              lastFailure.toolDebugSummary,
-              lastFailure.toolDebugPayload,
-            );
-          }
+            // If we get here without returning, something went wrong
+            if (lastFailure) {
+              return transformAntigravityResponse(
+                lastFailure.response,
+                lastFailure.streaming,
+                lastFailure.debugContext,
+                lastFailure.requestedModel,
+                lastFailure.projectId,
+                lastFailure.endpoint,
+                lastFailure.effectiveModel,
+                lastFailure.toolDebugMissing,
+                lastFailure.toolDebugSummary,
+                lastFailure.toolDebugPayload,
+              );
+            }
 
-          throw lastError || new Error("All Antigravity accounts failed");
+            throw lastError || new Error("All Antigravity accounts failed");
+          }
         },
       };
     },
@@ -485,7 +651,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
       {
         label: "OAuth with Google (Antigravity)",
         type: "oauth",
-        authorize: async (inputs) => {
+        authorize: async (inputs?: Record<string, string>) => {
           const isHeadless = !!(
             process.env.SSH_CONNECTION ||
             process.env.SSH_CLIENT ||
@@ -496,6 +662,25 @@ export const createAntigravityPlugin = (providerId: string) => async (
           // CLI flow (`opencode auth login`) passes an inputs object.
           if (inputs) {
             const accounts: Array<Extract<AntigravityTokenExchangeResult, { type: "success" }>> = [];
+
+            // Check for existing accounts and prompt user for login mode
+            let startFresh = true;
+            const existingStorage = await loadAccounts();
+            if (existingStorage && existingStorage.accounts.length > 0) {
+              const existingAccounts = existingStorage.accounts.map((acc, idx) => ({
+                email: acc.email,
+                index: idx,
+              }));
+              
+              const loginMode = await promptLoginMode(existingAccounts);
+              startFresh = loginMode === "fresh";
+              
+              if (startFresh) {
+                console.log("\nStarting fresh - existing accounts will be replaced.\n");
+              } else {
+                console.log("\nAdding to existing accounts.\n");
+              }
+            }
 
             while (accounts.length < MAX_OAUTH_ACCOUNTS) {
               console.log(`\n=== Antigravity OAuth (Account ${accounts.length + 1}) ===`);
@@ -579,8 +764,22 @@ export const createAntigravityPlugin = (providerId: string) => async (
 
               accounts.push(result);
 
+              // Show toast for successful account authentication
               try {
-                await persistAccountPool([result]);
+                await client.tui.showToast({
+                  body: {
+                    message: `Account ${accounts.length} authenticated${result.email ? ` (${result.email})` : ""}`,
+                    variant: "success",
+                  },
+                });
+              } catch {
+                // TUI may not be available in CLI mode
+              }
+
+              try {
+                // Use startFresh only on first account, subsequent accounts always append
+                const isFirstAccount = accounts.length === 1;
+                await persistAccountPool([result], isFirstAccount && startFresh);
               } catch {
                 // ignore
               }
@@ -613,8 +812,14 @@ export const createAntigravityPlugin = (providerId: string) => async (
             };
           }
 
-          // TUI flow (`/connect`) does not support per-account prompts yet.
+          // TUI flow (`/connect`) does not support per-account prompts.
+          // Default to adding new accounts (non-destructive).
+          // Users can run `opencode auth logout` first if they want a fresh start.
           const projectId = "";
+
+          // Check existing accounts count for toast message
+          const existingStorage = await loadAccounts();
+          const existingCount = existingStorage?.accounts.length ?? 0;
 
           let listener: OAuthListener | null = null;
           if (!isHeadless) {
@@ -649,9 +854,27 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   const result = await exchangeAntigravity(params.code, params.state);
                   if (result.type === "success") {
                     try {
-                      await persistAccountPool([result]);
+                      // TUI flow adds to existing accounts (non-destructive)
+                      await persistAccountPool([result], false);
                     } catch {
                       // ignore
+                    }
+
+                    // Show appropriate toast message
+                    const newTotal = existingCount + 1;
+                    const toastMessage = existingCount > 0
+                      ? `Added account${result.email ? ` (${result.email})` : ""} - ${newTotal} total`
+                      : `Authenticated${result.email ? ` (${result.email})` : ""}`;
+
+                    try {
+                      await client.tui.showToast({
+                        body: {
+                          message: toastMessage,
+                          variant: "success",
+                        },
+                      });
+                    } catch {
+                      // TUI may not be available
                     }
                   }
 
@@ -686,9 +909,27 @@ export const createAntigravityPlugin = (providerId: string) => async (
               const result = await exchangeAntigravity(params.code, params.state);
               if (result.type === "success") {
                 try {
-                  await persistAccountPool([result]);
+                  // TUI flow adds to existing accounts (non-destructive)
+                  await persistAccountPool([result], false);
                 } catch {
                   // ignore
+                }
+
+                // Show appropriate toast message
+                const newTotal = existingCount + 1;
+                const toastMessage = existingCount > 0
+                  ? `Added account${result.email ? ` (${result.email})` : ""} - ${newTotal} total`
+                  : `Authenticated${result.email ? ` (${result.email})` : ""}`;
+
+                try {
+                  await client.tui.showToast({
+                    body: {
+                      message: toastMessage,
+                      variant: "success",
+                    },
+                  });
+                } catch {
+                  // TUI may not be available
                 }
               }
 
@@ -698,7 +939,6 @@ export const createAntigravityPlugin = (providerId: string) => async (
         },
       },
       {
-        provider: providerId,
         label: "Manually enter API Key",
         type: "api",
       },

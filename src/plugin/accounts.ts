@@ -202,9 +202,16 @@ export class AccountManager {
 
   getMinWaitTimeMs(): number {
     const now = nowMs();
-    const available = this.accounts.some(
-      (a) => !a.isRateLimited || (a.rateLimitResetTime > 0 && now > a.rateLimitResetTime),
-    );
+    
+    // Clear expired cooldowns first (same logic as pickNext)
+    for (const acc of this.accounts) {
+      if (acc.isRateLimited && acc.rateLimitResetTime > 0 && now > acc.rateLimitResetTime) {
+        acc.isRateLimited = false;
+        acc.rateLimitResetTime = 0;
+      }
+    }
+    
+    const available = this.accounts.some((a) => !a.isRateLimited);
     if (available) {
       return 0;
     }

@@ -15,7 +15,15 @@ Enable Opencode to authenticate against **Antigravity** (Google's IDE) via OAuth
 
 ## Quick start
 
-1) **Add the plugin to config** (`~/.config/opencode/opencode.json` or project `.opencode.json`):
+### Step 1: Create your config file
+
+If this is your first time using Opencode, create the config directory first:
+
+```bash
+mkdir -p ~/.config/opencode
+```
+
+Then create or edit the config file at `~/.config/opencode/opencode.json`:
 
 ```json
 {
@@ -23,20 +31,35 @@ Enable Opencode to authenticate against **Antigravity** (Google's IDE) via OAuth
 }
 ```
 
-2) **Authenticate**
+> **Note:** You can also use a project-local `.opencode.json` file in your project root instead. The global config at `~/.config/opencode/opencode.json` applies to all projects.
 
-- For multi-account + per-account project IDs (recommended): run `opencode auth login`.
-- For a quick single-account connect: open `opencode` and run `/connect`.
-- Choose Google → **OAuth with Google (Antigravity)**.
-- Sign in via the browser and return to Opencode. If the browser doesn’t open, use the displayed link.
-- `opencode auth login` will ask for a project ID for each account, and after each sign-in you can add another account (up to 10).
+### Step 2: Authenticate
 
-3) **Declare the models you want**
+Run the authentication command:
 
-Add Antigravity models under the `provider.google.models` section of your config:
+```bash
+opencode auth login
+```
+
+1. Select **Google** as the provider
+2. Select **OAuth with Google (Antigravity)**
+3. **Project ID prompt:** You'll see this prompt:
+   ```
+   Project ID (leave blank to use your default project):
+   ```
+   **Just press Enter to skip this** — it's optional and only needed if you want to use a specific Google Cloud project. Most users can leave it blank.
+4. Sign in via the browser and return to Opencode. If the browser doesn't open, copy the displayed URL manually.
+5. After signing in, you can add more Google accounts (up to 10) for load balancing, or press Enter to finish.
+
+> **Alternative:** For a quick single-account setup without project ID options, open `opencode` and use the `/connect` command instead.
+
+### Step 3: Add the models you want to use
+
+Open the **same config file** you created in Step 1 (`~/.config/opencode/opencode.json`) and add the models under `provider.google.models`:
+
 ```json
 {
-  "plugin": ["opencode-antigravity-auth"],
+  "plugin": ["opencode-antigravity-auth@1.1.0"],
   "provider": {
     "google": {
       "models": {
@@ -88,19 +111,63 @@ Add Antigravity models under the `provider.google.models` section of your config
 }
 ```
 
-4) **Use a model**
+> **Tip:** You only need to add the models you plan to use. The example above includes all available models, but you can remove any you don't need.
+
+### Step 4: Use a model
 
 ```bash
 opencode run "Hello world" --model=google/gemini-3-pro-high
 ```
 
+Or start the interactive TUI and select a model from the model picker:
+
+```bash
+opencode
+```
+
 ## Multi-account load balancing
 
-- Account pool is stored in `~/.config/opencode/antigravity-accounts.json` (or `%APPDATA%/opencode/antigravity-accounts.json` on Windows).
-- This file contains OAuth refresh tokens; treat it like a password and don’t share/commit it.
-- TUI `/connect` only supports single-account sign-in (no per-account project ID prompts). Use `opencode auth login` to add multiple accounts or set per-account project IDs.
-- Each request picks the next account round-robin; on HTTP `429` the account is cooled down and the request retries with the next account.
-- If Google revokes a refresh token (`invalid_grant`), that account is removed from the pool; rerun `opencode auth login` to add it back.
+The plugin supports multiple Google accounts to maximize rate limits and provide automatic failover.
+
+### How it works
+
+- **Round-robin selection:** Each request uses the next account in the pool
+- **Automatic failover:** On HTTP `429` (rate limit), the plugin automatically switches to the next available account
+- **Smart cooldown:** Rate-limited accounts are temporarily cooled down and automatically become available again after the cooldown expires
+- **Single-account retry:** If you only have one account, the plugin waits for the rate limit to reset and retries automatically
+- **Toast notifications:** The TUI shows which account is being used and when switching occurs
+
+### Adding accounts
+
+**CLI flow (`opencode auth login`):**
+
+When you run `opencode auth login` and already have accounts saved, you'll be prompted:
+
+```
+2 account(s) saved:
+  1. user1@gmail.com
+  2. user2@gmail.com
+
+(a)dd new account(s) or (f)resh start? [a/f]:
+```
+
+- Press `a` to add more accounts to your existing pool
+- Press `f` to clear all existing accounts and start fresh
+
+**TUI flow (`/connect`):**
+
+The `/connect` command in the TUI adds accounts non-destructively — it will never clear your existing accounts. To start fresh via TUI, run `opencode auth logout` first, then `/connect`.
+
+### Account storage
+
+- Account pool is stored in `~/.config/opencode/antigravity-accounts.json` (or `%APPDATA%\opencode\antigravity-accounts.json` on Windows)
+- This file contains OAuth refresh tokens; **treat it like a password** and don't share or commit it
+- The plugin automatically syncs with OpenCode's auth state — if you log out via OpenCode, stale account storage is cleared automatically
+
+### Automatic account recovery
+
+- If Google revokes a refresh token (`invalid_grant`), that account is automatically removed from the pool
+- Rerun `opencode auth login` to re-add the account
 
 ## Debugging
 

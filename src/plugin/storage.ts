@@ -73,3 +73,15 @@ export async function saveAccounts(storage: AccountStorage): Promise<void> {
   const content = JSON.stringify(storage, null, 2);
   await fs.writeFile(path, content, "utf-8");
 }
+
+export async function clearAccounts(): Promise<void> {
+  try {
+    const path = getStoragePath();
+    await fs.unlink(path);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") {
+      console.error("[opencode-antigravity-auth] Failed to clear account storage:", error);
+    }
+  }
+}

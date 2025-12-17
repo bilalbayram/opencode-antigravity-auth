@@ -1,3 +1,4 @@
+import type { PluginInput } from "@opencode-ai/plugin";
 import type { AntigravityTokenExchangeResult } from "../antigravity/oauth";
 
 export interface OAuthAuthDetails {
@@ -31,6 +32,12 @@ export interface Provider {
 export interface LoaderResult {
   apiKey: string;
   fetch(input: RequestInfo, init?: RequestInit): Promise<Response>;
+}
+
+export type PluginClient = PluginInput["client"];
+
+export interface PluginContext {
+  client: PluginClient;
 }
 
 export type AuthPrompt =
@@ -69,20 +76,10 @@ export interface AuthMethod {
   authorize?: (inputs?: Record<string, string>) => Promise<OAuthAuthorizationResult>;
 }
 
-export interface PluginClient {
-  auth: {
-    set(input: { path: { id: string }; body: OAuthAuthDetails }): Promise<void>;
-  };
-}
-
-export interface PluginContext {
-  client: PluginClient;
-}
-
 export interface PluginResult {
   auth: {
     provider: string;
-    loader: (getAuth: GetAuth, provider: Provider) => Promise<LoaderResult | null>;
+    loader: (getAuth: GetAuth, provider: Provider) => Promise<LoaderResult | Record<string, unknown>>;
     methods: AuthMethod[];
   };
 }
