@@ -347,3 +347,8 @@ export function logModelFamily(url: string, extractedModel: string | null, famil
   if (!debugEnabled) return;
   logDebug(`[ModelFamily] url=${url} model=${extractedModel ?? "unknown"} family=${family}`);
 }
+
+export function debugLogToFile(message: string): void {
+  if (!debugEnabled) return;
+  logDebug(message);
+}

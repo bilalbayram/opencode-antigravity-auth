@@ -10,13 +10,10 @@ import {
   USER_OPENCODE_CONFIG,
   USER_OPENCODE_CONFIG_JSONC,
 } from "./constants";
-
-const DEBUG = process.env.OPENCODE_ANTIGRAVITY_DEBUG === "1" || process.env.OPENCODE_ANTIGRAVITY_DEBUG === "2" || process.env.OPENCODE_ANTIGRAVITY_DEBUG === "true" || process.env.OPENCODE_ANTIGRAVITY_DEBUG === "verbose";
+import { debugLogToFile } from "../../plugin/debug";
 
 function debugLog(message: string): void {
-  if (DEBUG) {
-    console.log(message);
-  }
+  debugLogToFile(message);
 }
 
 export function isLocalDevMode(directory: string): boolean {
@@ -128,6 +125,9 @@ export function findPluginEntry(directory: string): PluginEntryInfo | null {
           const pinnedVersion = entry.slice(PACKAGE_NAME.length + 1);
           const isPinned = pinnedVersion !== "latest";
           return { entry, isPinned, pinnedVersion: isPinned ? pinnedVersion : null, configPath };
+        }
+        if (entry.startsWith("file://") && entry.includes(PACKAGE_NAME)) {
+          return { entry, isPinned: false, pinnedVersion: null, configPath };
         }
       }
     } catch {

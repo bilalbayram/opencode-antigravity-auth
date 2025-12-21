@@ -2,13 +2,10 @@ import type { AutoUpdateCheckerOptions } from "./types";
 import { getCachedVersion, getLocalDevVersion, findPluginEntry, getLatestVersion, updatePinnedVersion } from "./checker";
 import { invalidatePackage } from "./cache";
 import { PACKAGE_NAME } from "./constants";
-
-const DEBUG = process.env.OPENCODE_ANTIGRAVITY_DEBUG === "1" || process.env.OPENCODE_ANTIGRAVITY_DEBUG === "2" || process.env.OPENCODE_ANTIGRAVITY_DEBUG === "true" || process.env.OPENCODE_ANTIGRAVITY_DEBUG === "verbose";
+import { debugLogToFile } from "../../plugin/debug";
 
 function debugLog(message: string): void {
-  if (DEBUG) {
-    console.log(message);
-  }
+  debugLogToFile(message);
 }
 
 interface PluginClient {
