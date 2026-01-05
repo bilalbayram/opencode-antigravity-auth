@@ -395,13 +395,37 @@ Create `~/.config/opencode/antigravity.json` (or `.opencode/antigravity.json` in
 | `max_rate_limit_wait_seconds` | `300` | Max wait time when rate limited (0=unlimited) |
 | `quota_fallback` | `false` | Try alternate quota when rate limited |
 
+### Account Selection
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `account_selection_strategy` | `"sticky"` | Strategy for distributing requests across accounts |
+
+**Available strategies:**
+
+| Strategy | Behavior | Best For |
+|----------|----------|----------|
+| `sticky` | Same account until rate-limited | Prompt cache preservation |
+| `round-robin` | Rotate to next account on every request | Maximum throughput |
+| `hybrid` | Touch all fresh accounts first, then sticky | Sync reset timers + cache |
+
+**Error handling:**
+
+| Error Type | Behavior |
+|------------|----------|
+| `MODEL_CAPACITY_EXHAUSTED` | Wait (escalating 5s→60s) and retry same account |
+| `QUOTA_EXCEEDED` | Switch to next available account immediately |
+
+This prevents unnecessary account switching when server-side capacity issues affect all accounts equally.
+
 ### Environment Overrides
 
 ```bash
-OPENCODE_ANTIGRAVITY_QUIET=1         # quiet_mode
-OPENCODE_ANTIGRAVITY_DEBUG=1         # debug
-OPENCODE_ANTIGRAVITY_LOG_DIR=/path   # log_dir
-OPENCODE_ANTIGRAVITY_KEEP_THINKING=1 # keep_thinking
+OPENCODE_ANTIGRAVITY_QUIET=1                              # quiet_mode
+OPENCODE_ANTIGRAVITY_DEBUG=1                              # debug
+OPENCODE_ANTIGRAVITY_LOG_DIR=/path                        # log_dir
+OPENCODE_ANTIGRAVITY_KEEP_THINKING=1                      # keep_thinking
+OPENCODE_ANTIGRAVITY_ACCOUNT_SELECTION_STRATEGY=round-robin  # account_selection_strategy
 ```
 
 <details>
@@ -427,6 +451,7 @@ OPENCODE_ANTIGRAVITY_KEEP_THINKING=1 # keep_thinking
   "proactive_refresh_check_interval_seconds": 300,
   "max_rate_limit_wait_seconds": 300,
   "quota_fallback": false,
+  "account_selection_strategy": "sticky",
   "signature_cache": {
     "enabled": true,
     "memory_ttl_seconds": 3600,
